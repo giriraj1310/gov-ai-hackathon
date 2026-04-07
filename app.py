@@ -1,0 +1,508 @@
+"""
+GovSpend Overlap Analyzer — v2
+An analyst copilot for government procurement oversight.
+
+Pipeline stages:
+  1. Ingest      — streaming chunked file reading
+  2. Normalise   — field alias mapping + value cleaning
+  3. Quality     — pre-analysis data quality report
+  4. Deduplicate — remove exact / near-exact duplicates
+  5. Block       — multi-strategy candidate pair generation
+  6. Score       — parallel weighted similarity scoring
+  7. Explain     — signal detection + analyst recommendations
+"""
+
+import hashlib
+import io
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from pipeline.ingestor    import ingest_file
+from pipeline.normalizer  import normalize_records
+from pipeline.quality     import assess_quality
+from pipeline.deduplicator import deduplicate
+from pipeline.blocker     import build_candidate_pairs
+from pipeline.scorer      import score_candidates, DEFAULT_WEIGHTS
+from pipeline.explainer   import generate_explanations
+from pipeline.exporter    import to_json, to_csv, to_html_report
+
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="GovSpend Analyzer",
+    page_icon="🏛️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown("""
+<style>
+div[data-testid="stExpander"] { border-left: 4px solid #1565C0; margin-bottom: 8px; }
+.stProgress > div > div { background-color: #1565C0; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+st.title("🏛️ GovSpend Overlap Analyzer")
+st.markdown(
+    "**An analyst copilot for government procurement oversight.** "
+    "Upload contract or spending data to surface potential duplications, "
+    "overlaps, and anomalies — each finding backed by transparent, auditable evidence."
+)
+st.caption(
+    "Decision-support tool only. All findings require human analyst review. "
+    "No automated procurement decisions are made."
+)
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — weights, threshold, advanced
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Settings")
+
+    st.markdown("**Similarity Weights**")
+    w_desc   = st.slider("Description",   0.0, 1.0, 0.40, 0.05)
+    w_vendor = st.slider("Vendor Match",  0.0, 1.0, 0.30, 0.05)
+    w_date   = st.slider("Date Proximity",0.0, 1.0, 0.15, 0.05)
+    w_amount = st.slider("Amount",        0.0, 1.0, 0.15, 0.05)
+
+    total_w = w_desc + w_vendor + w_date + w_amount
+    if abs(total_w - 1.0) > 0.01:
+        st.info(f"Sum = {total_w:.2f} — weights normalised automatically.")
+    else:
+        st.success(f"Weights sum = {total_w:.2f} ✓")
+
+    st.divider()
+    st.markdown("**Flagging Threshold**")
+    threshold = st.slider("Minimum risk score to flag", 0.0, 1.0, 0.50, 0.05)
+
+    st.divider()
+    st.markdown("**Advanced — Blocking**")
+    lsh_threshold = st.slider(
+        "LSH description threshold",
+        0.10, 0.90, 0.40, 0.05,
+        help="Lower = more description pairs found but more false positives.",
+    )
+    max_pairs = st.select_slider(
+        "Max candidate pairs",
+        options=[50_000, 100_000, 250_000, 500_000, 1_000_000],
+        value=500_000,
+        help="Hard cap on pairs sent to scoring. Raise for higher recall on large datasets.",
+    )
+
+    st.divider()
+    st.markdown(
+        "| Dimension | Method |\n"
+        "|-----------|--------|\n"
+        "| Description | TF-IDF cosine (L2-norm) |\n"
+        "| Vendor | Token Jaccard + containment |\n"
+        "| Date | Decaying proximity (5 yr) |\n"
+        "| Amount | Min/max ratio |"
+    )
+
+weights = {
+    "description": w_desc,
+    "vendor":      w_vendor,
+    "date":        w_date,
+    "amount":      w_amount,
+}
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — Upload
+# ---------------------------------------------------------------------------
+st.header("Step 1 — Upload")
+
+col_up, col_tip = st.columns([2, 1])
+with col_up:
+    uploaded_files = st.file_uploader(
+        "Upload one or more files",
+        type=["csv", "pdf", "html", "htm", "json", "txt"],
+        accept_multiple_files=True,
+    )
+with col_tip:
+    st.markdown("""
+    **Supported formats:** CSV · PDF · HTML · JSON · TXT
+
+    **Auto-detected fields**
+    `vendor · description · amount · date · department · contract_id`
+
+    Try `data/sample_contracts.csv` to see a full demo.
+    """)
+
+if not uploaded_files:
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# File fingerprint — invalidate cache when files change
+# ---------------------------------------------------------------------------
+file_buffers: dict[str, bytes] = {}
+for f in uploaded_files:
+    file_buffers[f.name] = f.read()
+    f.seek(0)
+
+current_sig = hashlib.md5(
+    "|".join(
+        f"{name}:{hashlib.md5(buf).hexdigest()}"
+        for name, buf in sorted(file_buffers.items())
+    ).encode()
+).hexdigest()
+
+if st.session_state.get("_file_sig") != current_sig:
+    for key in ("df_norm", "quality_report", "df_clean", "removed_df",
+                "candidates", "scored_df", "results", "dataset_summary"):
+        st.session_state.pop(key, None)
+    st.session_state["_file_sig"] = current_sig
+
+
+# ---------------------------------------------------------------------------
+# Stage 1–2: Ingest + Normalise (cached per file fingerprint)
+# ---------------------------------------------------------------------------
+if "df_norm" not in st.session_state:
+    all_records: list = []
+    all_logs: list    = []
+
+    ingest_status = st.status("Reading files…", expanded=True)
+    prog_bar      = st.progress(0.0)
+
+    def ingest_cb(done, total, msg):
+        prog_bar.progress(min(1.0, done / max(total, 1)))
+        ingest_status.write(msg)
+
+    for f in uploaded_files:
+        # Feed bytes back to ingestor so file pointer is fresh
+        import io as _io
+        fake_file = _io.BytesIO(file_buffers[f.name])
+        fake_file.name = f.name
+        records, logs = ingest_file(fake_file, progress_cb=ingest_cb)
+        all_records.extend(records)
+        all_logs.extend(logs)
+
+    prog_bar.progress(1.0)
+    ingest_status.update(
+        label=f"Extraction complete — {len(all_records):,} raw records.",
+        state="complete",
+        expanded=False,
+    )
+
+    if not all_records:
+        st.error("No records extracted. Check file format.")
+        st.stop()
+
+    with st.spinner("Normalising fields…"):
+        df_norm = normalize_records(pd.DataFrame(all_records))
+
+    st.session_state["df_norm"]    = df_norm
+    st.session_state["ingest_log"] = all_logs
+else:
+    df_norm = st.session_state["df_norm"]
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — Data Quality Report
+# ---------------------------------------------------------------------------
+st.header("Step 2 — Data Quality")
+
+if "quality_report" not in st.session_state:
+    with st.spinner("Assessing data quality…"):
+        qr = assess_quality(df_norm)
+    st.session_state["quality_report"] = qr
+else:
+    qr = st.session_state["quality_report"]
+
+# Summary metrics
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Total Records",      f"{qr.total_records:,}")
+m2.metric("Quality Score",      f"{qr.overall_score:.0%}")
+m3.metric("Duplicates Found",   f"{qr.duplicate_count:,}")
+m4.metric("Unique Vendors",     df_norm["vendor_normalized"].nunique())
+m5.metric("Short Descriptions", f"{qr.vocabulary_sparsity:.0%}",
+          help="Fraction of descriptions with fewer than 5 words.")
+
+# Field completeness bar chart
+field_names  = [r.name for r in qr.field_reports]
+completeness = [r.completeness for r in qr.field_reports]
+fig_q = go.Figure(go.Bar(
+    x=field_names, y=completeness,
+    marker_color=["#1565C0" if c >= 0.80 else "#f57c00" if c >= 0.50 else "#d32f2f"
+                  for c in completeness],
+    text=[f"{c:.0%}" for c in completeness],
+    textposition="outside",
+))
+fig_q.update_layout(
+    title="Field Completeness",
+    yaxis=dict(range=[0, 1.15], tickformat=".0%"),
+    height=260, margin=dict(t=40, b=0, l=0, r=0),
+)
+st.plotly_chart(fig_q, use_container_width=True)
+
+# Issues / warnings / blocking notes
+if qr.critical_issues:
+    for issue in qr.critical_issues:
+        st.error(f"**Critical:** {issue}")
+if qr.warnings:
+    with st.expander(f"{len(qr.warnings)} warning(s)", expanded=False):
+        for w in qr.warnings:
+            st.warning(w)
+if qr.blocking_notes:
+    with st.expander("Blocking strategy notes", expanded=False):
+        for note in qr.blocking_notes:
+            st.info(note)
+if qr.recommendations:
+    with st.expander("Recommendations for better results", expanded=False):
+        for rec in qr.recommendations:
+            st.markdown(f"- {rec}")
+
+with st.expander("View normalised records", expanded=False):
+    display_cols = [c for c in df_norm.columns
+                    if not c.endswith(("_parsed", "_numeric", "_normalized"))]
+    st.dataframe(df_norm[display_cols], use_container_width=True)
+
+with st.expander("Extraction log", expanded=False):
+    st.dataframe(pd.DataFrame(st.session_state.get("ingest_log", [])),
+                 use_container_width=True)
+
+if len(df_norm) < 2:
+    st.warning("At least 2 records are needed to run analysis.")
+    st.stop()
+
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Run Analysis
+# ---------------------------------------------------------------------------
+st.header("Step 3 — Run Analysis")
+
+run_clicked = st.button("▶  Run Overlap Analysis", type="primary")
+
+if run_clicked:
+    # Clear previous results so re-runs with new weights work correctly
+    for key in ("df_clean", "removed_df", "candidates", "scored_df", "results", "dataset_summary"):
+        st.session_state.pop(key, None)
+
+    with st.status("Running pipeline…", expanded=True) as pipeline_status:
+
+        # --- Deduplication ---
+        st.write("Removing duplicates…")
+        df_clean, removed_df = deduplicate(df_norm)
+        if len(removed_df) > 0:
+            st.write(f"Removed {len(removed_df):,} duplicate record(s). "
+                     f"{len(df_clean):,} unique records remain.")
+
+        # --- Blocking ---
+        block_prog = st.progress(0.0, text="Building candidate pairs…")
+
+        def block_cb(done, total, msg):
+            block_prog.progress(min(1.0, done / max(total, 1)), text=msg)
+
+        candidates = build_candidate_pairs(
+            df_clean,
+            lsh_threshold=lsh_threshold,
+            max_total_pairs=max_pairs,
+            progress_cb=block_cb,
+        )
+        block_prog.progress(1.0, text=f"Candidate pairs: {len(candidates):,}")
+        st.write(f"**{len(candidates):,}** candidate pairs identified "
+                 f"(from {len(df_clean):,} records via blocking).")
+
+        if not candidates:
+            st.error("No candidate pairs generated. Try lowering the LSH threshold.")
+            pipeline_status.update(label="Analysis failed.", state="error")
+            st.stop()
+
+        # --- Scoring ---
+        score_prog = st.progress(0.0, text="Scoring pairs…")
+
+        def score_cb(done, total):
+            pct = done / max(total, 1)
+            score_prog.progress(
+                min(1.0, pct),
+                text=f"Scoring: {done}/{total} batch(es) complete ({pct:.0%})",
+            )
+
+        scored_df = score_candidates(
+            df_clean,
+            candidates,
+            weights=weights,
+            progress_cb=score_cb,
+        )
+        score_prog.progress(1.0, text="Scoring complete.")
+        st.write(f"Scored {len(scored_df):,} pairs.")
+
+        # --- Explanations ---
+        st.write("Generating explanations…")
+        results = generate_explanations(scored_df, df_clean, threshold)
+
+        pipeline_status.update(
+            label="Analysis complete.", state="complete", expanded=False
+        )
+
+    # Cache results
+    st.session_state["df_clean"]        = df_clean
+    st.session_state["removed_df"]      = removed_df
+    st.session_state["candidates"]      = candidates
+    st.session_state["scored_df"]       = scored_df
+    st.session_state["results"]         = results
+    st.session_state["dataset_summary"] = {
+        "total_records":  len(df_norm),
+        "pairs_analysed": len(scored_df),
+    }
+
+if "results" not in st.session_state:
+    st.info("Click **Run Overlap Analysis** to start.")
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Findings
+# ---------------------------------------------------------------------------
+results:   list         = st.session_state["results"]
+scored_df: pd.DataFrame = st.session_state["scored_df"]
+summary:   dict         = st.session_state.get("dataset_summary", {})
+
+st.header("Step 4 — Findings")
+
+flagged     = [r for r in results if r["above_threshold"]]
+total_pairs = len(results)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Pairs Scored",        f"{total_pairs:,}")
+c2.metric("Cases Flagged",       len(flagged),
+          help=f"Risk score ≥ {threshold:.0%}")
+c3.metric("High Risk  (≥75%)",   sum(1 for r in flagged if r["risk_score"] >= 0.75))
+c4.metric("Medium Risk (50–74%)", sum(1 for r in flagged if 0.50 <= r["risk_score"] < 0.75))
+
+# Risk distribution chart
+if results:
+    scores = [r["risk_score"] for r in results]
+    fig_d  = go.Figure()
+    fig_d.add_trace(go.Histogram(
+        x=scores, nbinsx=40,
+        marker_color=[
+            "#c62828" if s >= 0.75 else "#e65100" if s >= 0.50 else "#90caf9"
+            for s in scores
+        ],
+    ))
+    fig_d.add_vline(
+        x=threshold, line_dash="dash", line_color="#333",
+        annotation_text=f"Threshold ({threshold:.0%})",
+        annotation_position="top right",
+    )
+    fig_d.update_layout(
+        title="Risk Score Distribution",
+        xaxis_title="Risk Score",
+        yaxis_title="Number of Pairs",
+        height=240,
+        margin=dict(t=40, b=0, l=0, r=0),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_d, use_container_width=True)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Flagged case cards
+# ---------------------------------------------------------------------------
+if not flagged:
+    st.success(
+        f"No pairs exceeded the {threshold:.0%} risk threshold. "
+        "Try lowering the threshold or reviewing data quality."
+    )
+else:
+    st.markdown(
+        f"**{len(flagged)} case(s) flagged for analyst review**, ranked by risk score."
+    )
+
+    for i, case in enumerate(flagged):
+        risk  = case["risk_score"]
+        badge = ("🔴 HIGH RISK"   if risk >= 0.75 else
+                 "🟡 MEDIUM RISK" if risk >= 0.50 else
+                 "🟢 LOW RISK")
+
+        vendor_label = (
+            case["vendor_a"] if case["vendor_a"] == case["vendor_b"]
+            else f"{case['vendor_a']}  ↔  {case['vendor_b']}"
+        )
+
+        with st.expander(
+            f"{badge}  |  {risk:.0%}  |  {vendor_label}  —  {case['pair_id']}",
+            expanded=(i == 0),
+        ):
+            ea, eb = st.columns(2)
+            with ea:
+                st.markdown("**Contract A**")
+                st.json(case["record_a"], expanded=True)
+            with eb:
+                st.markdown("**Contract B**")
+                st.json(case["record_b"], expanded=True)
+
+            st.markdown("---")
+            st.markdown("**Why flagged**")
+            for signal in case["signals"]:
+                st.markdown(f"- {signal}")
+
+            st.markdown("**Score breakdown**")
+            bd   = case["score_breakdown"]
+            scols = st.columns(4)
+            for col, (dim, val) in zip(scols, bd.items()):
+                col.metric(dim.capitalize(), f"{val:.0%}")
+
+            st.progress(min(1.0, risk), text=f"Overall risk: {risk:.0%}")
+            st.markdown("---")
+
+            if risk >= 0.75:
+                st.error(f"**Recommendation:** {case['recommendation']}")
+            elif risk >= 0.50:
+                st.warning(f"**Recommendation:** {case['recommendation']}")
+            else:
+                st.info(f"**Recommendation:** {case['recommendation']}")
+
+# ---------------------------------------------------------------------------
+# Step 5 — Export
+# ---------------------------------------------------------------------------
+if flagged:
+    st.divider()
+    st.header("Step 5 — Export")
+
+    ex1, ex2, ex3 = st.columns(3)
+
+    with ex1:
+        st.download_button(
+            "⬇️ JSON (audit trail)",
+            data=to_json(flagged),
+            file_name="flagged_cases.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with ex2:
+        st.download_button(
+            "⬇️ CSV (Excel-ready)",
+            data=to_csv(flagged),
+            file_name="flagged_cases.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with ex3:
+        st.download_button(
+            "⬇️ HTML Report (shareable)",
+            data=to_html_report(flagged, summary),
+            file_name="govspend_report.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+
+st.markdown("---")
+st.caption(
+    "GovSpend Analyzer v2 · Hackathon Prototype · "
+    "Outputs are indicative only and require qualified analyst review."
+)
