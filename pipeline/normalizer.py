@@ -39,6 +39,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         # UK / AU procurement
         "supplier_name", "contractor_name", "organisation_name",
         "entity_name", "payee_name", "beneficiary",
+        # CanadaBuys (after stripping French suffix)
+        "vendorname", "suppliername", "vendeur",
     ],
     "description": [
         # Generic
@@ -68,6 +70,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         # UK / AU
         "value_gbp", "value_aud", "contract_value_aud", "total_contract_value",
         "approved_amount", "committed_amount",
+        # CanadaBuys (after stripping French suffix)
+        "contractvalue", "originalvalue",
     ],
     "date": [
         # Generic
@@ -80,6 +84,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         # UK / AU
         "contract_start_date", "commencement_date", "published_date",
         "notification_date", "publish_date",
+        # CanadaBuys (after stripping French suffix)
+        "contractawarddate", "contractperiodstart",
     ],
     "department": [
         "department", "dept", "agency", "office", "ministry",
@@ -92,6 +98,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         # UK / AU
         "organisation", "entity", "buyer_name", "purchasing_entity",
         "procuring_entity", "government_department",
+        # CanadaBuys (after stripping French suffix)
+        "departmentname", "owneracronym",
     ],
     "contract_id": [
         "contract_id", "contract_number", "id", "contract_no",
@@ -101,6 +109,8 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "modification_number", "transaction_unique_key",
         # UK / AU
         "contract_reference", "tender_reference", "notice_identifier",
+        # CanadaBuys
+        "referencenumber", "solicitationnumber",
     ],
     "end_date": [
         "end_date", "period_of_performance_end", "expiry_date",
@@ -110,6 +120,13 @@ FIELD_ALIASES: dict[str, list[str]] = {
         "period_of_performance_potential_end_date",
         # UK / AU
         "contract_end_date", "expiration_date",
+        # CanadaBuys
+        "contractperiodend",
+    ],
+    # CanadaBuys-specific: amendment number (tracked separately for business logic)
+    "amendment_number": [
+        "amendmentnumber", "amendment_number", "amendment_no",
+        "modification_number",
     ],
 }
 
@@ -139,14 +156,21 @@ def normalize_records(df: pd.DataFrame) -> pd.DataFrame:
     Accept a raw DataFrame (column names may be anything) and return a
     normalised DataFrame with standard column names and cleaned values.
 
-    Also records which original columns mapped to which standard fields
-    in df.attrs["column_mapping"] for UI diagnostics.
+    Handles bilingual CanadaBuys column names (e.g. vendorName-nomFournisseur)
+    by stripping the French suffix before alias matching.
     """
     df = df.copy()
 
-    # --- Step 1: lowercase all column names ---
+    # --- Step 1: normalise column names ---
+    # For bilingual hyphenated names (CanadaBuys format), take only the English part.
+    # e.g. "vendorName-nomFournisseur" → "vendorname"
     original_cols = list(df.columns)
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    def _norm_col(c: str) -> str:
+        c = str(c).strip()
+        if "-" in c:
+            c = c.split("-")[0]   # Keep English half only
+        return c.lower().replace(" ", "_")
+    df.columns = [_norm_col(c) for c in df.columns]
 
     # --- Step 2: map aliases to standard names ---
     rename_map: dict[str, str] = {}
@@ -159,11 +183,9 @@ def normalize_records(df: pd.DataFrame) -> pd.DataFrame:
                 break
     df.rename(columns=rename_map, inplace=True)
 
-    # Store mapping for diagnostics (original name → standard name)
-    col_mapping = {orig: rename_map.get(norm, "(unmapped)")
-                   for orig, norm in zip(original_cols,
-                                         [str(c).strip().lower().replace(" ", "_")
-                                          for c in original_cols])}
+    # Store mapping for diagnostics — use _norm_col so bilingual names map correctly
+    col_mapping = {orig: rename_map.get(_norm_col(orig), "(unmapped)")
+                   for orig in original_cols}
     df.attrs["column_mapping"] = col_mapping
     df.attrs["unmapped_cols"]  = [orig for orig, std in col_mapping.items()
                                    if std == "(unmapped)"]

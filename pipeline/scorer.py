@@ -124,20 +124,26 @@ def _build_tfidf(texts: List[str]) -> Optional[sp.csr_matrix]:
     Fit TF-IDF on all descriptions and return an L2-normalised sparse matrix.
     L2-normalisation means cosine(i, j) == mat[i] · mat[j] (dot product).
     Returns None if not enough non-empty texts.
+
+    Uses conservative max_features to limit memory on large datasets.
     """
     non_empty = [t for t in texts if t.strip()]
     if len(non_empty) < 2:
         return None
+    # Scale features with dataset size to bound memory
+    n = len(texts)
+    max_feat = min(5_000, max(500, n // 2))
     try:
         vec = TfidfVectorizer(
             stop_words="english",
             ngram_range=(1, 2),
-            min_df=1,
-            max_features=20_000,
+            min_df=2,          # Ignore terms appearing in only 1 doc (noise reduction)
+            max_features=max_feat,
             sublinear_tf=True,
+            dtype="float64",   # float32 not supported by sklearn TfidfVectorizer
         )
         mat = vec.fit_transform(texts)
-        return sk_normalize(mat, norm="l2", copy=False)   # in-place for memory efficiency
+        return sk_normalize(mat, norm="l2", copy=False)
     except Exception:
         return None
 
