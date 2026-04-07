@@ -80,6 +80,20 @@ def build_candidate_pairs(
         progress_cb(len(steps), len(steps) + 1, "Blocking by description similarity (LSH)…")
     _block_by_description_lsh(df, candidates, lsh_threshold, LSH_NUM_PERM)
 
+    # -----------------------------------------------------------------------
+    # Fallback: if ALL structured strategies produced nothing (e.g. the
+    # dataset has unrecognised column names and all fields mapped to defaults),
+    # generate candidates via stratified random sampling so analysis can still
+    # run and surface obvious patterns.
+    # -----------------------------------------------------------------------
+    if not candidates:
+        if progress_cb:
+            progress_cb(
+                len(steps) + 1, len(steps) + 1,
+                "No structured blocks found — using stratified random sampling as fallback…",
+            )
+        candidates = _fallback_random_sampling(df, max_records_per_block)
+
     if progress_cb:
         progress_cb(len(steps) + 1, len(steps) + 1, f"Candidate set built: {len(candidates):,} pairs.")
 
@@ -87,6 +101,38 @@ def build_candidate_pairs(
     if len(candidates) > max_total_pairs:
         sorted_pairs = sorted(candidates)
         candidates   = set(random.sample(sorted_pairs, max_total_pairs))
+
+    return candidates
+
+
+def _fallback_random_sampling(
+    df: pd.DataFrame,
+    sample_size: int = 400,
+) -> Set[CandidatePair]:
+    """
+    Last-resort candidate generation when no structured blocking strategy fires.
+    Splits the dataset into evenly-spaced strata and samples from each,
+    then generates all pairs within each stratum.
+
+    This ensures the system always produces output even with completely
+    unrecognised column schemas.
+    """
+    n = len(df)
+    # Number of strata scales with dataset size
+    n_strata = max(1, min(20, n // sample_size))
+    stratum_size = n // n_strata
+
+    candidates: Set[CandidatePair] = set()
+    indices = list(range(n))
+
+    for s in range(n_strata):
+        start = s * stratum_size
+        end   = (s + 1) * stratum_size if s < n_strata - 1 else n
+        stratum = indices[start:end]
+        if len(stratum) > sample_size:
+            stratum = random.sample(stratum, sample_size)
+        for i, j in combinations(sorted(stratum), 2):
+            candidates.add((i, j))
 
     return candidates
 

@@ -245,6 +245,37 @@ fig_q.update_layout(
 )
 st.plotly_chart(fig_q, use_container_width=True)
 
+# Column mapping diagnostics — always show so user can verify detection
+col_mapping = df_norm.attrs.get("column_mapping", {})
+unmapped    = df_norm.attrs.get("unmapped_cols", [])
+if col_mapping:
+    mapped_rows   = [(orig, std) for orig, std in col_mapping.items() if std != "(unmapped)"]
+    unmapped_rows = [(orig, "(not used)") for orig in unmapped]
+
+    with st.expander(
+        f"Column detection — {len(mapped_rows)} field(s) mapped, {len(unmapped_rows)} unmapped",
+        expanded=(len(mapped_rows) == 0),   # expand if nothing was mapped (problem indicator)
+    ):
+        if mapped_rows:
+            st.markdown("**Mapped fields**")
+            st.dataframe(
+                pd.DataFrame(mapped_rows, columns=["Your column", "Standard field"]),
+                hide_index=True, use_container_width=True,
+            )
+        if unmapped_rows:
+            st.markdown("**Unmapped columns** (not used in analysis)")
+            st.dataframe(
+                pd.DataFrame(unmapped_rows, columns=["Your column", "Status"]),
+                hide_index=True, use_container_width=True,
+            )
+        if len(mapped_rows) == 0:
+            st.warning(
+                "None of your column names matched known aliases. "
+                "The system will attempt catch-all detection and fall back to "
+                "random-sample blocking. For best results, rename key columns to: "
+                "`vendor_name`, `description`, `award_amount`, `award_date`, `department`."
+            )
+
 # Issues / warnings / blocking notes
 if qr.critical_issues:
     for issue in qr.critical_issues:
