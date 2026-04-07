@@ -1,0 +1,16 @@
+contract_id,vendor_name,description,award_date,contract_amount,department
+GOV-2024-001,TechSecure Solutions LLC,Cybersecurity assessment and penetration testing for agency network infrastructure and endpoints,2024-01-15,125000,Department of Defense
+GOV-2024-002,TechSecure Inc,Network security assessment and vulnerability testing services for IT systems and infrastructure,2024-02-20,118500,Department of Defense
+GOV-2024-003,Excellence Training Corp,Leadership training program for senior federal employees and managers across divisions,2024-03-01,89000,Office of Personnel Management
+GOV-2024-004,Excellence Training LLC,Executive leadership development workshop and coaching program for federal managers,2024-04-10,92000,Office of Personnel Management
+GOV-2024-005,NextGen IT Services,Desktop support and IT helpdesk services for agency staff and endpoint devices,2024-06-01,340000,General Services Administration
+GOV-2024-006,NextGen Information Technology,IT helpdesk and desktop support services for government agency operations and staff,2024-07-15,345000,General Services Administration
+GOV-2024-007,BuildRight Construction Group,Interstate highway bridge inspection maintenance and structural repair services,2024-01-05,2500000,Department of Transportation
+GOV-2024-008,GreenCheck Environmental,Environmental compliance audit and regulatory reporting for facilities,2024-04-20,67000,Environmental Protection Agency
+GOV-2024-009,MediaWorks Group Inc,Strategic communications and public affairs consulting for agency outreach,2024-02-14,155000,Department of Health and Human Services
+GOV-2024-010,DataDriven Analytics Corp,Enterprise data analytics platform licensing and implementation support,2024-05-30,220000,Department of Treasury
+GOV-2024-011,CyberShield Federal,Cybersecurity monitoring and threat detection services for network operations center,2024-08-01,98000,Department of Defense
+GOV-2024-012,TechSecure Solutions LLC,Information security consulting and risk assessment for IT infrastructure and systems,2024-09-10,110000,Department of Homeland Security
+GOV-2024-013,Apex Consulting Group,Policy analysis and program evaluation services for federal initiatives,2024-03-15,178000,Office of Management and Budget
+GOV-2024-014,Apex Consulting LLC,Program evaluation and policy analysis for government grant programs,2024-04-22,182000,Office of Management and Budget
+GOV-2024-015,DataDriven Analytics Corp,Business intelligence dashboarding and data visualization for executive reporting,2024-11-01,195000,Department of Treasury
