@@ -183,6 +183,10 @@ def normalize_records(df: pd.DataFrame) -> pd.DataFrame:
                 break
     df.rename(columns=rename_map, inplace=True)
 
+    # Drop duplicate columns — happens when two source columns normalise to the same
+    # standard name (e.g. "description" and "description-description" both → "description")
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
     # Store mapping for diagnostics — use _norm_col so bilingual names map correctly
     col_mapping = {orig: rename_map.get(_norm_col(orig), "(unmapped)")
                    for orig in original_cols}
