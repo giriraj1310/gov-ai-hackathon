@@ -63,57 +63,55 @@ st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Sidebar — weights, threshold, advanced
+# Sidebar — simplified, no technical sliders
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    st.markdown("**Similarity Weights**")
-    w_desc   = st.slider("Description",   0.0, 1.0, 0.40, 0.05)
-    w_vendor = st.slider("Vendor Match",  0.0, 1.0, 0.30, 0.05)
-    w_date   = st.slider("Date Proximity",0.0, 1.0, 0.15, 0.05)
-    w_amount = st.slider("Amount",        0.0, 1.0, 0.15, 0.05)
-
-    total_w = w_desc + w_vendor + w_date + w_amount
-    if abs(total_w - 1.0) > 0.01:
-        st.info(f"Sum = {total_w:.2f} — weights normalised automatically.")
-    else:
-        st.success(f"Weights sum = {total_w:.2f} ✓")
-
-    st.divider()
-    st.markdown("**Flagging Threshold**")
-    threshold = st.slider("Minimum risk score to flag", 0.0, 1.0, 0.50, 0.05)
-
-    st.divider()
-    st.markdown("**Advanced — Blocking**")
-    lsh_threshold = st.slider(
-        "LSH description threshold",
-        0.10, 0.90, 0.40, 0.05,
-        help="Lower = more description pairs found but more false positives.",
-    )
-    max_pairs = st.select_slider(
-        "Max candidate pairs",
-        options=[50_000, 100_000, 250_000, 500_000, 1_000_000],
-        value=500_000,
-        help="Hard cap on pairs sent to scoring. Raise for higher recall on large datasets.",
+    st.markdown("**What should the system focus on?**")
+    focus = st.radio(
+        "Focus",
+        ["Balanced (recommended)", "Prioritise vendor matches", "Prioritise description overlap"],
+        index=0,
+        label_visibility="collapsed",
     )
 
     st.divider()
-    st.markdown(
-        "| Dimension | Method |\n"
-        "|-----------|--------|\n"
-        "| Description | TF-IDF cosine (L2-norm) |\n"
-        "| Vendor | Token Jaccard + containment |\n"
-        "| Date | Decaying proximity (5 yr) |\n"
-        "| Amount | Min/max ratio |"
+    st.markdown("**How sensitive should flagging be?**")
+    sensitivity = st.radio(
+        "Sensitivity",
+        ["High — catch everything (more false positives)",
+         "Medium — balanced (recommended)",
+         "Low — only clear-cut cases"],
+        index=1,
+        label_visibility="collapsed",
     )
 
-weights = {
-    "description": w_desc,
-    "vendor":      w_vendor,
-    "date":        w_date,
-    "amount":      w_amount,
-}
+    st.divider()
+    st.caption(
+        "The system automatically configures itself based on your dataset size. "
+        "No technical tuning required."
+    )
+    st.caption("Every finding shows exactly why it was flagged.")
+
+# Translate plain-language choices to weights + threshold
+if focus == "Prioritise vendor matches":
+    weights = {"description": 0.25, "vendor": 0.50, "date": 0.15, "amount": 0.10}
+elif focus == "Prioritise description overlap":
+    weights = {"description": 0.55, "vendor": 0.20, "date": 0.15, "amount": 0.10}
+else:
+    weights = {"description": 0.40, "vendor": 0.30, "date": 0.15, "amount": 0.15}
+
+if "High" in sensitivity:
+    threshold = 0.35
+elif "Low" in sensitivity:
+    threshold = 0.65
+else:
+    threshold = 0.50
+
+# These are auto-configured based on dataset size (set after upload when n is known)
+lsh_threshold = 0.60   # Conservative — only obvious text matches
+max_pairs     = 200_000
 
 
 # ---------------------------------------------------------------------------
@@ -314,23 +312,67 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.header("Step 3 — Run Analysis")
 
+# --- Pre-run size guidance ---
+n_records = len(df_norm)
+if n_records > 50_000:
+    est = "10–30 minutes"
+    mem_warn = True
+elif n_records > 10_000:
+    est = "2–5 minutes"
+    mem_warn = False
+elif n_records > 1_000:
+    est = "15–60 seconds"
+    mem_warn = False
+else:
+    est = "a few seconds"
+    mem_warn = False
+
+st.info(
+    f"**{n_records:,} records loaded.** "
+    f"Estimated analysis time: **{est}**. "
+    + ("LSH text-similarity blocking is automatically disabled for large datasets "
+       "to protect memory — structural blocking (vendor, department, date, amount) will be used instead."
+       if n_records > 3_000 else "")
+)
+if mem_warn:
+    st.warning(
+        "This is a very large dataset. Analysis may take a while and use significant memory. "
+        "Consider uploading a filtered subset (e.g. one department or one year) for a faster demo."
+    )
+
+st.markdown("**What will happen when you click Run:**")
+st.markdown(
+    "1. Remove exact structural duplicates from the dataset  \n"
+    "2. Group records into candidate pairs using vendor, department, date, and amount similarity  \n"
+    "3. Score every candidate pair across all four dimensions  \n"
+    "4. Rank and explain the highest-risk cases  \n"
+    "5. Show you findings with evidence — nothing is flagged without a reason"
+)
+
 run_clicked = st.button("▶  Run Overlap Analysis", type="primary")
 
 if run_clicked:
-    # Clear previous results so re-runs with new weights work correctly
+    # Clear previous results so re-runs with new settings work correctly
     for key in ("df_clean", "removed_df", "candidates", "scored_df", "results", "dataset_summary"):
         st.session_state.pop(key, None)
 
     with st.status("Running pipeline…", expanded=True) as pipeline_status:
 
         # --- Deduplication ---
-        st.write("Removing duplicates…")
+        st.write("Step 1/4 — Checking for structural duplicates…")
         df_clean, removed_df = deduplicate(df_norm)
         if len(removed_df) > 0:
-            st.write(f"Removed {len(removed_df):,} duplicate record(s). "
-                     f"{len(df_clean):,} unique records remain.")
+            st.write(
+                f"Found {len(removed_df):,} rows with identical vendor + amount + date. "
+                f"These look like duplicate export rows (same transaction reported twice), "
+                f"not separate contracts. They've been set aside. "
+                f"{len(df_clean):,} unique records remain for analysis."
+            )
+        else:
+            st.write(f"No structural duplicates found. All {len(df_clean):,} records are distinct.")
 
         # --- Blocking ---
+        st.write("Step 2/4 — Identifying candidate pairs to compare…")
         block_prog = st.progress(0.0, text="Building candidate pairs…")
 
         def block_cb(done, total, msg):
@@ -343,22 +385,28 @@ if run_clicked:
             progress_cb=block_cb,
         )
         block_prog.progress(1.0, text=f"Candidate pairs: {len(candidates):,}")
-        st.write(f"**{len(candidates):,}** candidate pairs identified "
-                 f"(from {len(df_clean):,} records via blocking).")
+        st.write(
+            f"Identified **{len(candidates):,}** record pairs worth comparing "
+            f"(out of {len(df_clean):,} × {len(df_clean):,} = "
+            f"{len(df_clean)**2:,} possible combinations). "
+            f"Blocking reduced comparisons by "
+            f"**{max(0, 100 - len(candidates)*100//(len(df_clean)**2 or 1))}%**."
+        )
 
         if not candidates:
-            st.error("No candidate pairs generated. Try lowering the LSH threshold.")
+            st.error("No candidate pairs generated — the dataset may have too few populated fields.")
             pipeline_status.update(label="Analysis failed.", state="error")
             st.stop()
 
         # --- Scoring ---
+        st.write("Step 3/4 — Scoring each candidate pair…")
         score_prog = st.progress(0.0, text="Scoring pairs…")
 
         def score_cb(done, total):
             pct = done / max(total, 1)
             score_prog.progress(
                 min(1.0, pct),
-                text=f"Scoring: {done}/{total} batch(es) complete ({pct:.0%})",
+                text=f"Scoring batches: {done}/{total} complete ({pct:.0%})",
             )
 
         scored_df = score_candidates(
@@ -368,10 +416,10 @@ if run_clicked:
             progress_cb=score_cb,
         )
         score_prog.progress(1.0, text="Scoring complete.")
-        st.write(f"Scored {len(scored_df):,} pairs.")
+        st.write(f"Scored {len(scored_df):,} pairs across 4 dimensions.")
 
         # --- Explanations ---
-        st.write("Generating explanations…")
+        st.write("Step 4/4 — Ranking findings and writing explanations…")
         results = generate_explanations(scored_df, df_clean, threshold)
 
         pipeline_status.update(

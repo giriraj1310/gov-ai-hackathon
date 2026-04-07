@@ -31,11 +31,12 @@ from pipeline import CandidatePair
 # Tunables
 # ---------------------------------------------------------------------------
 
-MAX_RECORDS_PER_BLOCK = 400    # Max records per leaf block before sampling
-MAX_TOTAL_PAIRS       = 500_000  # Hard cap on total candidate pairs
-LSH_THRESHOLD         = 0.40   # MinHash Jaccard threshold for description pairing
-LSH_NUM_PERM          = 64     # MinHash permutations (64 is fast; 128 is more accurate)
-MIN_WORDS_FOR_LSH     = 3      # Skip LSH for descriptions shorter than this
+MAX_RECORDS_PER_BLOCK = 400      # Max records per leaf block before sampling
+MAX_TOTAL_PAIRS       = 200_000  # Hard cap on total candidate pairs
+LSH_THRESHOLD         = 0.60     # MinHash Jaccard threshold — high enough to avoid explosion
+LSH_NUM_PERM          = 64       # MinHash permutations
+MIN_WORDS_FOR_LSH     = 5        # Skip LSH for descriptions shorter than this
+LSH_MAX_RECORDS       = 3_000    # Disable LSH entirely above this row count — too slow/memory-heavy
 
 ProgressCb = Optional[Callable[[int, int, str], None]]
 
@@ -75,10 +76,17 @@ def build_candidate_pairs(
             progress_cb(idx, len(steps) + 1, msg)
         fn(df, candidates, max_records_per_block)
 
-    # LSH blocking (optional — needs datasketch)
-    if progress_cb:
-        progress_cb(len(steps), len(steps) + 1, "Blocking by description similarity (LSH)…")
-    _block_by_description_lsh(df, candidates, lsh_threshold, LSH_NUM_PERM)
+    # LSH blocking — skipped for large datasets (memory/time cost is prohibitive)
+    if n <= LSH_MAX_RECORDS:
+        if progress_cb:
+            progress_cb(len(steps), len(steps) + 1, "Blocking by description similarity (LSH)…")
+        _block_by_description_lsh(df, candidates, lsh_threshold, LSH_NUM_PERM)
+    else:
+        if progress_cb:
+            progress_cb(
+                len(steps), len(steps) + 1,
+                f"LSH skipped for large dataset ({n:,} rows) — structural blocking only.",
+            )
 
     # -----------------------------------------------------------------------
     # Fallback: if ALL structured strategies produced nothing (e.g. the
